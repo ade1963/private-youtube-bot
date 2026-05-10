@@ -1,6 +1,6 @@
 from datetime import date
 
-from bot_config import parse_chat_ids, parse_size
+from bot_config import load_config, parse_chat_ids, parse_size
 from media_settings import MediaSettings
 from state_store import ArtifactRecord, StateStore, current_week_start, now_iso
 from url_tools import cache_identity, clean_url
@@ -14,6 +14,26 @@ def test_parse_size_accepts_human_units():
 
 def test_parse_chat_ids_accepts_common_separators():
     assert parse_chat_ids("1, 2;3\n4") == {1, 2, 3, 4}
+
+
+def test_load_config_reads_telegram_upload_limit(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "TELEGRAM_BOT_TOKEN=token",
+                "ALLOWED_CHAT_IDS=1",
+                "ADMIN_CHAT_IDS=1",
+                "TELEGRAM_MAX_UPLOAD_BYTES=25MB",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    config = load_config(env_path)
+
+    assert config.telegram_max_upload_bytes == 25 * 1024**2
 
 
 def test_clean_url_normalizes_watch_links():

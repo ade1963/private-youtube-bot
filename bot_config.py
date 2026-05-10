@@ -44,6 +44,7 @@ class BotConfig:
     download_dir: Path
     max_storage_bytes: int
     weekly_user_limit_bytes: int
+    telegram_max_upload_bytes: int
     default_media: str
     default_video_resolution: int
     default_audio_quality: str
@@ -129,6 +130,7 @@ def load_config(env_path: str | Path = ".env") -> BotConfig:
         download_dir=download_dir,
         max_storage_bytes=parse_size(os.getenv("MAX_STORAGE_BYTES", "1GB")),
         weekly_user_limit_bytes=parse_size(os.getenv("WEEKLY_USER_LIMIT_BYTES", "1GB")),
+        telegram_max_upload_bytes=parse_size(os.getenv("TELEGRAM_MAX_UPLOAD_BYTES", "50MB")),
         default_media=default_media,
         default_video_resolution=_read_positive_int("DEFAULT_VIDEO_RESOLUTION", "720"),
         default_audio_quality=_read_audio_quality("DEFAULT_AUDIO_QUALITY", "192"),

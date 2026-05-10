@@ -24,6 +24,7 @@ ALLOWED_CHAT_IDS=111111111,222222222
 ADMIN_CHAT_IDS=111111111
 MAX_STORAGE_BYTES=1GB
 WEEKLY_USER_LIMIT_BYTES=1GB
+TELEGRAM_MAX_UPLOAD_BYTES=50MB
 DEFAULT_MEDIA=audio
 DEFAULT_VIDEO_RESOLUTION=720
 DEFAULT_AUDIO_QUALITY=192
@@ -70,6 +71,9 @@ Behavior:
   are removed first.
 - Per-user weekly usage is capped by `WEEKLY_USER_LIMIT_BYTES`; the week resets
   on Monday according to the VPS local date.
+- Files above `TELEGRAM_MAX_UPLOAD_BYTES` are not uploaded. The public Telegram
+  Bot API limit is currently 50 MB; a local Bot API server can support larger
+  uploads.
 - Errors are recorded with stack traces in `data/state.json`; admins can inspect
   recent diagnostics with `/errors`.
 

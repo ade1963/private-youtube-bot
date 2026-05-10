@@ -241,6 +241,14 @@ class TelegramYtdlpBot:
         return record
 
     async def send_artifact(self, chat_id: int, message, record: ArtifactRecord) -> None:
+        if record.size_bytes > self.config.telegram_max_upload_bytes:
+            raise DownloadFailure(
+                "Telegram refused this file because it is too large for Bot API upload.\n"
+                f"File size: {format_size(record.size_bytes)}\n"
+                f"Configured upload limit: {format_size(self.config.telegram_max_upload_bytes)}\n"
+                "Try lower video resolution or lower audio quality."
+            )
+
         async with self.state_lock:
             if not self.state.can_add_week_usage(
                 chat_id,
