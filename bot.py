@@ -23,8 +23,11 @@ from downloader_service import (
     existing_artifact_file,
     make_cache_key,
 )
+from env_file import update_env_list
+from file_parts import part_count, write_file_part
 from media_settings import MediaSettings
 from state_store import ArtifactRecord, StateStore, now_iso
+from user_registry import UserRegistry
 from url_tools import UrlError, clean_url
 
 
@@ -45,6 +48,8 @@ class TelegramYtdlpBot:
         self.config = config
         self.default_settings = MediaSettings.from_config(config)
         self.state = StateStore(config.data_dir / "state.json", config.error_history_limit)
+        self.user_registry = UserRegistry(config.data_dir / "users.json")
+        self.allowed_chat_ids = config.allowed_chat_ids | self.user_registry.chat_ids()
         self.state_lock = asyncio.Lock()
         self.download_locks: dict[str, asyncio.Lock] = {}
 
@@ -58,12 +63,14 @@ class TelegramYtdlpBot:
         application.add_handler(CommandHandler("stats", self.stats))
         application.add_handler(CommandHandler("errors", self.errors))
         application.add_handler(CommandHandler("cleanup", self.cleanup))
+        application.add_handler(CommandHandler("adduser", self.add_user))
+        application.add_handler(CommandHandler("users", self.users))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_url))
         application.add_error_handler(self.unhandled_error)
         return application
 
     def is_allowed(self, chat_id: int) -> bool:
-        return chat_id in self.config.allowed_chat_ids
+        return chat_id in self.allowed_chat_ids
 
     def is_admin(self, chat_id: int) -> bool:
         return chat_id in self.config.admin_chat_ids
@@ -100,11 +107,11 @@ class TelegramYtdlpBot:
             "/settings - show your defaults\n"
             "/set media audio|video\n"
             "/set resolution 720\n"
-            "/set audio_quality 192\n"
+            "/set audio_quality 96\n"
             "/set audio_format mp3\n"
             "/resetsettings - use global defaults again\n"
             "\n"
-            "Admins: /stats, /errors, /cleanup"
+            "Admins: /stats, /errors, /cleanup, /adduser, /users"
         )
 
     async def settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -123,7 +130,7 @@ class TelegramYtdlpBot:
         if len(context.args) < 2:
             await update.effective_message.reply_text(
                 "Use: /set media audio|video, /set resolution 720, "
-                "/set audio_quality 192, or /set audio_format mp3"
+                "/set audio_quality 96, or /set audio_format mp3"
             )
             return
 
@@ -178,10 +185,19 @@ class TelegramYtdlpBot:
 
         try:
             async with lock:
-                record = await self.get_or_download_artifact(cleaned_url, settings, key, status)
+                record, from_cache = await self.get_or_download_artifact(
+                    chat_id,
+                    cleaned_url,
+                    settings,
+                    key,
+                    status,
+                )
 
             await self.send_artifact(chat_id, message, record)
-            await status.edit_text("Done.")
+            if from_cache:
+                await status.edit_text(f"Done. Cache hit: artifact hash {record.key}.")
+            else:
+                await status.edit_text("Done.")
         except Exception as exc:
             await self.report_error(
                 update,
@@ -192,18 +208,20 @@ class TelegramYtdlpBot:
 
     async def get_or_download_artifact(
         self,
+        chat_id: int,
         cleaned_url: str,
         settings: MediaSettings,
         key: str,
         status_message,
-    ) -> ArtifactRecord:
+    ) -> tuple[ArtifactRecord, bool]:
         async with self.state_lock:
             cached = self.state.get_artifact(key)
             if cached:
                 self.state.touch_artifact(key)
-                self.state.record_cache_hit()
+                self.state.record_cache_delivery(chat_id, cached, "manifest")
                 self.state.save()
-                return cached
+                LOGGER.info("Cache hit for chat_id=%s key=%s title=%s", chat_id, cached.key, cached.title)
+                return cached, True
 
             orphan_path = existing_artifact_file(self.config, key, settings)
             if orphan_path:
@@ -220,9 +238,10 @@ class TelegramYtdlpBot:
                     profile=settings.cache_profile(),
                 )
                 self.state.set_artifact(record)
-                self.state.record_cache_hit()
+                self.state.record_cache_delivery(chat_id, record, "file_hash")
                 self.state.save()
-                return record
+                LOGGER.info("Cache hit from file hash for chat_id=%s key=%s", chat_id, record.key)
+                return record, True
 
         await status_message.edit_text("Downloading...")
         record = await asyncio.to_thread(download_artifact, cleaned_url, settings, self.config)
@@ -238,14 +257,19 @@ class TelegramYtdlpBot:
             self.state.record_download()
             self.state.cleanup_storage(self.config.max_storage_bytes, keep_keys={record.key})
             self.state.save()
-        return record
+        return record, False
 
     async def send_artifact(self, chat_id: int, message, record: ArtifactRecord) -> None:
-        if record.size_bytes > self.config.telegram_max_upload_bytes:
+        chunks = part_count(record.size_bytes, self.config.telegram_part_size_bytes)
+        if chunks > self.config.max_upload_parts:
+            async with self.state_lock:
+                self.state.remove_artifact(record.key)
+                self.state.save()
             raise DownloadFailure(
-                "Telegram refused this file because it is too large for Bot API upload.\n"
+                "Artifact is too large for Telegram parts and was removed from cache.\n"
                 f"File size: {format_size(record.size_bytes)}\n"
-                f"Configured upload limit: {format_size(self.config.telegram_max_upload_bytes)}\n"
+                f"Part size: {format_size(self.config.telegram_part_size_bytes)}\n"
+                f"Max parts: {self.config.max_upload_parts}\n"
                 "Try lower video resolution or lower audio quality."
             )
 
@@ -268,17 +292,51 @@ class TelegramYtdlpBot:
             self.state.save()
 
         try:
-            with record.path.open("rb") as handle:
-                await message.reply_document(
-                    document=InputFile(handle, filename=artifact_filename(record)),
-                    caption=f"{record.title}\n{format_size(record.size_bytes)}",
+            if chunks == 1:
+                with record.path.open("rb") as handle:
+                    await message.reply_document(
+                        document=InputFile(handle, filename=artifact_filename(record)),
+                        caption=f"{record.title}\n{format_size(record.size_bytes)}",
+                    )
+            else:
+                await message.reply_text(
+                    f"Sending {format_size(record.size_bytes)} in {chunks} parts."
                 )
+                await self.send_artifact_parts(message, record, chunks)
         except Exception:
             async with self.state_lock:
                 self.state.add_week_usage(chat_id, -record.size_bytes)
                 self.state.record_bytes_sent(-record.size_bytes)
                 self.state.save()
             raise
+
+    async def send_artifact_parts(self, message, record: ArtifactRecord, chunks: int) -> None:
+        base_name = artifact_filename(record)
+        chunks_dir = self.config.data_dir / "chunks" / record.key
+        offset = 0
+        try:
+            for index in range(1, chunks + 1):
+                part_size = min(self.config.telegram_part_size_bytes, record.size_bytes - offset)
+                part_path = chunks_dir / f"{base_name}.part{index:03d}of{chunks:03d}"
+                await asyncio.to_thread(
+                    write_file_part,
+                    record.path,
+                    part_path,
+                    offset,
+                    part_size,
+                )
+                with part_path.open("rb") as handle:
+                    await message.reply_document(
+                        document=InputFile(handle, filename=part_path.name),
+                        caption=f"{record.title}\nPart {index}/{chunks}",
+                    )
+                part_path.unlink(missing_ok=True)
+                offset += part_size
+        finally:
+            if chunks_dir.exists():
+                for leftover in chunks_dir.glob("*"):
+                    leftover.unlink(missing_ok=True)
+                chunks_dir.rmdir()
 
     async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self.require_admin(update):
@@ -288,11 +346,16 @@ class TelegramYtdlpBot:
             stats = self.state.state["stats"]
             total_storage = self.state.total_artifact_bytes()
             artifact_count = len(self.state.state["artifacts"])
+            cache_events = self.state.state.get("cache_events", [])[-5:]
             user_lines = []
-            for chat_id in sorted(self.config.allowed_chat_ids):
+            for chat_id in sorted(self.allowed_chat_ids):
                 used = self.state.get_week_usage(chat_id)
                 user_lines.append(f"{chat_id}: {format_size(used)}")
             self.state.save()
+        cache_lines = [
+            f"{event['chat_id']}: {event['source']} {event['key']}"
+            for event in reversed(cache_events)
+        ]
 
         await update.effective_message.reply_text(
             "Stats:\n"
@@ -303,9 +366,44 @@ class TelegramYtdlpBot:
             f"Errors: {stats.get('errors_total', 0)}\n"
             f"Artifacts: {artifact_count}\n"
             f"Storage: {format_size(total_storage)} / {format_size(self.config.max_storage_bytes)}\n"
+            "Recent cache sends:\n"
+            + ("\n".join(cache_lines) if cache_lines else "none")
+            + "\n"
             "Weekly usage:\n"
             + "\n".join(user_lines)
         )
+
+    async def add_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.require_admin(update):
+            return
+        if not context.args:
+            await update.effective_message.reply_text("Use: /adduser <chat_id> [nickname]")
+            return
+        try:
+            chat_id = int(context.args[0])
+        except ValueError:
+            await update.effective_message.reply_text("chat_id must be a number")
+            return
+        nickname = " ".join(context.args[1:]).strip() or f"user-{chat_id}"
+        added_by = update.effective_chat.id
+
+        record = self.user_registry.add_user(chat_id, nickname, added_by)
+        self.allowed_chat_ids.add(chat_id)
+        update_env_list(self.config.env_path, "ALLOWED_CHAT_IDS", self.allowed_chat_ids)
+        await update.effective_message.reply_text(
+            f"Added {record.chat_id} as {record.nickname}. Updated .env and data/users.json."
+        )
+
+    async def users(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.require_admin(update):
+            return
+        registry = {record.chat_id: record for record in self.user_registry.list_users()}
+        lines = []
+        for chat_id in sorted(self.allowed_chat_ids):
+            nickname = registry[chat_id].nickname if chat_id in registry else "(from .env)"
+            marker = " admin" if chat_id in self.config.admin_chat_ids else ""
+            lines.append(f"{chat_id}: {nickname}{marker}")
+        await update.effective_message.reply_text("Users:\n" + "\n".join(lines))
 
     async def errors(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self.require_admin(update):

@@ -1,8 +1,11 @@
 from datetime import date
 
 from bot_config import load_config, parse_chat_ids, parse_size
+from env_file import update_env_list
+from file_parts import part_count, write_file_part
 from media_settings import MediaSettings
 from state_store import ArtifactRecord, StateStore, current_week_start, now_iso
+from user_registry import UserRegistry
 from url_tools import cache_identity, clean_url
 
 
@@ -16,7 +19,7 @@ def test_parse_chat_ids_accepts_common_separators():
     assert parse_chat_ids("1, 2;3\n4") == {1, 2, 3, 4}
 
 
-def test_load_config_reads_telegram_upload_limit(tmp_path, monkeypatch):
+def test_load_config_reads_telegram_part_settings(tmp_path, monkeypatch):
     env_path = tmp_path / ".env"
     env_path.write_text(
         "\n".join(
@@ -24,7 +27,8 @@ def test_load_config_reads_telegram_upload_limit(tmp_path, monkeypatch):
                 "TELEGRAM_BOT_TOKEN=token",
                 "ALLOWED_CHAT_IDS=1",
                 "ADMIN_CHAT_IDS=1",
-                "TELEGRAM_MAX_UPLOAD_BYTES=25MB",
+                "TELEGRAM_PART_SIZE_BYTES=25MB",
+                "MAX_UPLOAD_PARTS=4",
             ]
         ),
         encoding="utf-8",
@@ -33,7 +37,29 @@ def test_load_config_reads_telegram_upload_limit(tmp_path, monkeypatch):
 
     config = load_config(env_path)
 
-    assert config.telegram_max_upload_bytes == 25 * 1024**2
+    assert config.telegram_part_size_bytes == 25 * 1024**2
+    assert config.max_upload_parts == 4
+    assert config.default_audio_quality == "96"
+
+
+def test_telegram_part_size_is_capped_at_50mb(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "TELEGRAM_BOT_TOKEN=token",
+                "ALLOWED_CHAT_IDS=1",
+                "ADMIN_CHAT_IDS=1",
+                "TELEGRAM_PART_SIZE_BYTES=100MB",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    config = load_config(env_path)
+
+    assert config.telegram_part_size_bytes == 50 * 1024**2
 
 
 def test_clean_url_normalizes_watch_links():
@@ -52,6 +78,40 @@ def test_clean_url_normalizes_short_links():
 
 def test_cache_identity_uses_video_id():
     assert cache_identity("https://www.youtube.com/watch?v=abc123") == "youtube:abc123"
+
+
+def test_update_env_list_preserves_other_lines(tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text("TOKEN=x\nALLOWED_CHAT_IDS=1\nOTHER=y\n", encoding="utf-8")
+
+    update_env_list(env_path, "ALLOWED_CHAT_IDS", {3, 1, 2})
+
+    assert env_path.read_text(encoding="utf-8").splitlines() == [
+        "TOKEN=x",
+        "ALLOWED_CHAT_IDS=1,2,3",
+        "OTHER=y",
+    ]
+
+
+def test_user_registry_stores_nickname(tmp_path):
+    registry = UserRegistry(tmp_path / "users.json")
+
+    registry.add_user(123, "Alice", added_by=1)
+    reloaded = UserRegistry(tmp_path / "users.json")
+
+    assert reloaded.chat_ids() == {123}
+    assert reloaded.list_users()[0].nickname == "Alice"
+
+
+def test_write_file_part_creates_binary_chunk(tmp_path):
+    source = tmp_path / "source.bin"
+    target = tmp_path / "target.part"
+    source.write_bytes(b"abcdef")
+
+    write_file_part(source, target, offset=2, size_bytes=3)
+
+    assert target.read_bytes() == b"cde"
+    assert part_count(101, 50) == 3
 
 
 def test_media_settings_update_validates_values():

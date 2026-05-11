@@ -78,8 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--audio-quality",
         type=audio_quality,
-        default="192",
-        help="MP3 quality: 0-10 VBR, or bitrate like 128/192/320 (default: 192)",
+        default="96",
+        help="MP3 quality: 0-10 VBR, or bitrate like 96/128/320 (default: 96)",
     )
     parser.add_argument(
         "--audio-format",

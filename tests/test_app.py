@@ -18,7 +18,7 @@ def test_audio_defaults_to_mp3_download(tmp_path):
         {
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
-            "preferredquality": "192",
+            "preferredquality": "96",
         }
     ]
 

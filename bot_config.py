@@ -37,6 +37,7 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class BotConfig:
+    env_path: Path
     token: str
     allowed_chat_ids: set[int]
     admin_chat_ids: set[int]
@@ -44,7 +45,8 @@ class BotConfig:
     download_dir: Path
     max_storage_bytes: int
     weekly_user_limit_bytes: int
-    telegram_max_upload_bytes: int
+    telegram_part_size_bytes: int
+    max_upload_parts: int
     default_media: str
     default_video_resolution: int
     default_audio_quality: str
@@ -98,7 +100,8 @@ def _read_audio_quality(name: str, default: str) -> str:
 
 
 def load_config(env_path: str | Path = ".env") -> BotConfig:
-    load_dotenv(env_path)
+    resolved_env_path = Path(env_path).expanduser().resolve()
+    load_dotenv(resolved_env_path, override=True)
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
@@ -121,8 +124,12 @@ def load_config(env_path: str | Path = ".env") -> BotConfig:
 
     data_dir = Path(os.getenv("BOT_DATA_DIR", "data")).expanduser().resolve()
     download_dir = Path(os.getenv("DOWNLOAD_DIR", "downloads")).expanduser().resolve()
+    telegram_part_size_bytes = parse_size(os.getenv("TELEGRAM_PART_SIZE_BYTES", "50MB"))
+    if telegram_part_size_bytes <= 0:
+        raise ConfigError("TELEGRAM_PART_SIZE_BYTES must be greater than zero")
 
     return BotConfig(
+        env_path=resolved_env_path,
         token=token,
         allowed_chat_ids=allowed_chat_ids | admin_chat_ids,
         admin_chat_ids=admin_chat_ids,
@@ -130,10 +137,11 @@ def load_config(env_path: str | Path = ".env") -> BotConfig:
         download_dir=download_dir,
         max_storage_bytes=parse_size(os.getenv("MAX_STORAGE_BYTES", "1GB")),
         weekly_user_limit_bytes=parse_size(os.getenv("WEEKLY_USER_LIMIT_BYTES", "1GB")),
-        telegram_max_upload_bytes=parse_size(os.getenv("TELEGRAM_MAX_UPLOAD_BYTES", "50MB")),
+        telegram_part_size_bytes=min(telegram_part_size_bytes, parse_size("50MB")),
+        max_upload_parts=_read_positive_int("MAX_UPLOAD_PARTS", "3"),
         default_media=default_media,
         default_video_resolution=_read_positive_int("DEFAULT_VIDEO_RESOLUTION", "720"),
-        default_audio_quality=_read_audio_quality("DEFAULT_AUDIO_QUALITY", "192"),
+        default_audio_quality=_read_audio_quality("DEFAULT_AUDIO_QUALITY", "96"),
         default_audio_format=default_audio_format,
         error_history_limit=_read_positive_int("ERROR_HISTORY_LIMIT", "100"),
     )

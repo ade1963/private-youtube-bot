@@ -24,10 +24,11 @@ ALLOWED_CHAT_IDS=111111111,222222222
 ADMIN_CHAT_IDS=111111111
 MAX_STORAGE_BYTES=1GB
 WEEKLY_USER_LIMIT_BYTES=1GB
-TELEGRAM_MAX_UPLOAD_BYTES=50MB
+TELEGRAM_PART_SIZE_BYTES=50MB
+MAX_UPLOAD_PARTS=3
 DEFAULT_MEDIA=audio
 DEFAULT_VIDEO_RESOLUTION=720
-DEFAULT_AUDIO_QUALITY=192
+DEFAULT_AUDIO_QUALITY=96
 DEFAULT_AUDIO_FORMAT=mp3
 ```
 
@@ -47,7 +48,7 @@ User commands:
 /set media audio
 /set media video
 /set resolution 720
-/set audio_quality 192
+/set audio_quality 96
 /set audio_format mp3
 /resetsettings
 ```
@@ -59,6 +60,8 @@ Admin commands:
 /errors
 /errors 10
 /cleanup
+/adduser 333333333 Alice
+/users
 ```
 
 Behavior:
@@ -71,9 +74,13 @@ Behavior:
   are removed first.
 - Per-user weekly usage is capped by `WEEKLY_USER_LIMIT_BYTES`; the week resets
   on Monday according to the VPS local date.
-- Files above `TELEGRAM_MAX_UPLOAD_BYTES` are not uploaded. The public Telegram
-  Bot API limit is currently 50 MB; a local Bot API server can support larger
-  uploads.
+- Files are sent as one or more binary parts. `TELEGRAM_PART_SIZE_BYTES` is
+  capped at 50 MB, and `MAX_UPLOAD_PARTS` defaults to 3. Artifacts larger than
+  that combined limit are removed from cache.
+- Admins can add users with `/adduser <chat_id> [nickname]`. Chat IDs are
+  written back to `.env`; nicknames are stored in `data/users.json`.
+- Cache sends are written to `data/state.json`, logged, shown to the user as a
+  cache hit, and summarized in `/stats`.
 - Errors are recorded with stack traces in `data/state.json`; admins can inspect
   recent diagnostics with `/errors`.
 
@@ -82,7 +89,7 @@ Behavior:
 Download MP3 audio:
 
 ```powershell
-python app.py "https://www.youtube.com/watch?v=VIDEO_ID" --media audio --audio-quality 192
+python app.py "https://www.youtube.com/watch?v=VIDEO_ID" --media audio --audio-quality 96
 ```
 
 Download MP4 video up to 720p:
@@ -115,7 +122,7 @@ python app.py "URL" --media audio --cookies-from-browser chrome
 url                         one or more YouTube URLs
 --media audio|video         audio creates MP3 by default; video creates MP4
 --resolution 480|720|1080   maximum video height
---audio-quality 0-10|192    MP3 quality, either VBR 0-10 or bitrate
+--audio-quality 0-10|96     MP3 quality, either VBR 0-10 or bitrate
 --audio-format mp3|m4a|opus|wav|flac
 --output-dir downloads      output folder
 --playlist                  allow playlist downloads

@@ -69,6 +69,7 @@ def empty_state() -> dict[str, Any]:
         "users": {},
         "artifacts": {},
         "errors": [],
+        "cache_events": [],
         "stats": {
             "requests": 0,
             "downloads": 0,
@@ -96,6 +97,7 @@ class StateStore:
         self.state.setdefault("users", {})
         self.state.setdefault("artifacts", {})
         self.state.setdefault("errors", [])
+        self.state.setdefault("cache_events", [])
         self.state.setdefault("stats", empty_state()["stats"])
 
     def save(self) -> None:
@@ -216,6 +218,26 @@ class StateStore:
 
     def record_cache_hit(self) -> None:
         self.state["stats"]["cache_hits"] = int(self.state["stats"].get("cache_hits", 0)) + 1
+
+    def record_cache_delivery(
+        self,
+        chat_id: int,
+        record: ArtifactRecord,
+        source: str,
+        limit: int = 100,
+    ) -> None:
+        self.record_cache_hit()
+        self.state["cache_events"].append(
+            {
+                "created_at": now_iso(),
+                "chat_id": chat_id,
+                "key": record.key,
+                "title": record.title,
+                "size_bytes": record.size_bytes,
+                "source": source,
+            }
+        )
+        self.state["cache_events"] = self.state["cache_events"][-limit:]
 
     def record_bytes_sent(self, size_bytes: int) -> None:
         self.state["stats"]["bytes_sent"] = max(
