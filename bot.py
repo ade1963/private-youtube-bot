@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 from html import escape
@@ -142,7 +143,7 @@ class TelegramYtdlpBot:
                 updated = current.update(name, value)
                 self.state.set_user_settings(chat_id, updated)
                 self.state.save()
-        except ValueError as exc:
+        except (ValueError, argparse.ArgumentTypeError) as exc:
             await update.effective_message.reply_text(str(exc))
             return
 
@@ -343,6 +344,7 @@ class TelegramYtdlpBot:
                     offset,
                     part_size,
                 )
+                LOGGER.info("Uploading part %d/%d key=%s size=%s", index, chunks, record.key, format_size(part_size))
                 with part_path.open("rb") as handle:
                     await message.reply_document(
                         document=InputFile(handle, filename=part_path.name),

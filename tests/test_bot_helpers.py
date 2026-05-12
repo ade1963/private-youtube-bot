@@ -76,7 +76,7 @@ def test_load_config_reads_telegram_part_settings(tmp_path, monkeypatch):
     assert config.default_audio_quality == "96"
 
 
-def test_telegram_part_size_is_capped_at_50mb(tmp_path, monkeypatch):
+def test_telegram_part_size_is_capped_at_49mb(tmp_path, monkeypatch):
     env_path = tmp_path / ".env"
     env_path.write_text(
         "\n".join(
@@ -93,7 +93,7 @@ def test_telegram_part_size_is_capped_at_50mb(tmp_path, monkeypatch):
 
     config = load_config(env_path)
 
-    assert config.telegram_part_size_bytes == 50 * 1024**2
+    assert config.telegram_part_size_bytes == 49 * 1024**2
 
 
 def test_clean_url_normalizes_watch_links():
