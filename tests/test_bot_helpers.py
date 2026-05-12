@@ -1,12 +1,46 @@
+import asyncio
 from datetime import date
+from unittest.mock import AsyncMock, MagicMock
 
 from bot_config import load_config, parse_chat_ids, parse_size
+from bot import TelegramYtdlpBot
 from env_file import update_env_list
 from file_parts import part_count, write_file_part
 from media_settings import MediaSettings
 from state_store import ArtifactRecord, StateStore, current_week_start, now_iso
 from user_registry import UserRegistry
 from url_tools import cache_identity, clean_url
+
+
+def _make_bot(tmp_path, weekly_limit=1024**3):
+    config = MagicMock()
+    config.telegram_part_size_bytes = 50 * 1024**2
+    config.max_upload_parts = 3
+    config.weekly_user_limit_bytes = weekly_limit
+    config.data_dir = tmp_path
+    config.error_history_limit = 100
+
+    bot = TelegramYtdlpBot.__new__(TelegramYtdlpBot)
+    bot.config = config
+    bot.state = StateStore(tmp_path / "state.json")
+    bot.state_lock = asyncio.Lock()
+    return bot
+
+
+def _make_record(tmp_path, media="video", size=100):
+    path = tmp_path / f"artifact.{'mp4' if media == 'video' else 'mp3'}"
+    path.write_bytes(b"x" * size)
+    return ArtifactRecord(
+        key="testkey",
+        path=path,
+        title="Test",
+        size_bytes=size,
+        media=media,
+        created_at=now_iso(),
+        last_accessed_at=now_iso(),
+        url="https://example.com/v",
+        profile=f"{media}:mp4:720" if media == "video" else "audio:mp3:192",
+    )
 
 
 def test_parse_size_accepts_human_units():
@@ -176,3 +210,29 @@ def test_cleanup_storage_removes_oldest_artifacts(tmp_path):
     assert [record.key for record in removed] == ["first"]
     assert not first.exists()
     assert second.exists()
+
+
+def test_cache_hit_does_not_charge_weekly_usage(tmp_path):
+    bot = _make_bot(tmp_path)
+    record = _make_record(tmp_path, media="video", size=100)
+    bot.state.set_artifact(record)
+
+    message = MagicMock()
+    message.reply_video = AsyncMock()
+
+    asyncio.run(bot.send_artifact(123, message, record, from_cache=True))
+
+    assert bot.state.get_week_usage(123) == 0
+
+
+def test_fresh_download_charges_weekly_usage(tmp_path):
+    bot = _make_bot(tmp_path)
+    record = _make_record(tmp_path, media="audio", size=200)
+    bot.state.set_artifact(record)
+
+    message = MagicMock()
+    message.reply_audio = AsyncMock()
+
+    asyncio.run(bot.send_artifact(123, message, record, from_cache=False))
+
+    assert bot.state.get_week_usage(123) == 200

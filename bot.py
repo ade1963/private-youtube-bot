@@ -193,7 +193,7 @@ class TelegramYtdlpBot:
                     status,
                 )
 
-            await self.send_artifact(chat_id, message, record)
+            await self.send_artifact(chat_id, message, record, from_cache=from_cache)
             if from_cache:
                 await status.edit_text(f"Done. Cache hit: artifact hash {record.key}.")
             else:
@@ -259,7 +259,9 @@ class TelegramYtdlpBot:
             self.state.save()
         return record, False
 
-    async def send_artifact(self, chat_id: int, message, record: ArtifactRecord) -> None:
+    async def send_artifact(
+        self, chat_id: int, message, record: ArtifactRecord, from_cache: bool = False
+    ) -> None:
         chunks = part_count(record.size_bytes, self.config.telegram_part_size_bytes)
         if chunks > self.config.max_upload_parts:
             async with self.state_lock:
@@ -274,30 +276,45 @@ class TelegramYtdlpBot:
             )
 
         async with self.state_lock:
-            if not self.state.can_add_week_usage(
-                chat_id,
-                record.size_bytes,
-                self.config.weekly_user_limit_bytes,
-            ):
-                used = self.state.get_week_usage(chat_id)
-                raise DownloadFailure(
-                    "Weekly limit exceeded. "
-                    f"Used {format_size(used)} of "
-                    f"{format_size(self.config.weekly_user_limit_bytes)}; "
-                    f"this file is {format_size(record.size_bytes)}."
-                )
-            self.state.add_week_usage(chat_id, record.size_bytes)
+            if not from_cache:
+                if not self.state.can_add_week_usage(
+                    chat_id,
+                    record.size_bytes,
+                    self.config.weekly_user_limit_bytes,
+                ):
+                    used = self.state.get_week_usage(chat_id)
+                    raise DownloadFailure(
+                        "Weekly limit exceeded. "
+                        f"Used {format_size(used)} of "
+                        f"{format_size(self.config.weekly_user_limit_bytes)}; "
+                        f"this file is {format_size(record.size_bytes)}."
+                    )
+                self.state.add_week_usage(chat_id, record.size_bytes)
             self.state.record_bytes_sent(record.size_bytes)
             self.state.touch_artifact(record.key)
             self.state.save()
 
         try:
             if chunks == 1:
+                filename = artifact_filename(record)
                 with record.path.open("rb") as handle:
-                    await message.reply_document(
-                        document=InputFile(handle, filename=artifact_filename(record)),
-                        caption=f"{record.title}\n{format_size(record.size_bytes)}",
-                    )
+                    if record.media == "video":
+                        await message.reply_video(
+                            video=InputFile(handle, filename=filename),
+                            caption=f"{record.title}\n{format_size(record.size_bytes)}",
+                            supports_streaming=True,
+                        )
+                    elif record.media == "audio":
+                        await message.reply_audio(
+                            audio=InputFile(handle, filename=filename),
+                            title=record.title,
+                            caption=format_size(record.size_bytes),
+                        )
+                    else:
+                        await message.reply_document(
+                            document=InputFile(handle, filename=filename),
+                            caption=f"{record.title}\n{format_size(record.size_bytes)}",
+                        )
             else:
                 await message.reply_text(
                     f"Sending {format_size(record.size_bytes)} in {chunks} parts."
@@ -305,7 +322,8 @@ class TelegramYtdlpBot:
                 await self.send_artifact_parts(message, record, chunks)
         except Exception:
             async with self.state_lock:
-                self.state.add_week_usage(chat_id, -record.size_bytes)
+                if not from_cache:
+                    self.state.add_week_usage(chat_id, -record.size_bytes)
                 self.state.record_bytes_sent(-record.size_bytes)
                 self.state.save()
             raise
