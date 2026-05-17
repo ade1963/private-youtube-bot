@@ -25,8 +25,8 @@ from downloader_service import (
     make_cache_key,
 )
 from env_file import update_env_list
-from file_parts import part_count, write_file_part
 from media_settings import MediaSettings
+from media_segments import MediaSegment, SegmentError, segment_count, split_playable_media
 from state_store import ArtifactRecord, StateStore, now_iso
 from user_registry import UserRegistry
 from url_tools import UrlError, clean_url
@@ -177,9 +177,7 @@ class TelegramYtdlpBot:
             self.state.cleanup_storage(self.config.max_storage_bytes)
             self.state.save()
 
-        status = await message.reply_text(
-            f"URL: {cleaned_url}\nProfile: {settings.describe()}\nChecking cache..."
-        )
+        status = await message.reply_text("Checking cache...")
 
         key = make_cache_key(cleaned_url, settings)
         lock = self.download_locks.setdefault(key, asyncio.Lock())
@@ -195,10 +193,8 @@ class TelegramYtdlpBot:
                 )
 
             await self.send_artifact(chat_id, message, record, from_cache=from_cache)
-            if from_cache:
-                await status.edit_text(f"Done. Cache hit: artifact hash {record.key}.")
-            else:
-                await status.edit_text("Done.")
+            await self.delete_message_safely(status)
+            await self.delete_message_safely(message)
         except Exception as exc:
             await self.report_error(
                 update,
@@ -263,16 +259,19 @@ class TelegramYtdlpBot:
     async def send_artifact(
         self, chat_id: int, message, record: ArtifactRecord, from_cache: bool = False
     ) -> None:
-        chunks = part_count(record.size_bytes, self.config.telegram_part_size_bytes)
-        if chunks > self.config.max_upload_parts:
+        segments_needed = segment_count(
+            record.size_bytes,
+            self.config.telegram_part_size_bytes,
+        )
+        if segments_needed > self.config.max_upload_parts:
             async with self.state_lock:
                 self.state.remove_artifact(record.key)
                 self.state.save()
             raise DownloadFailure(
-                "Artifact is too large for Telegram parts and was removed from cache.\n"
+                "Artifact is too large for playable Telegram media segments and was removed from cache.\n"
                 f"File size: {format_size(record.size_bytes)}\n"
-                f"Part size: {format_size(self.config.telegram_part_size_bytes)}\n"
-                f"Max parts: {self.config.max_upload_parts}\n"
+                f"Segment size: {format_size(self.config.telegram_part_size_bytes)}\n"
+                f"Max segments: {self.config.max_upload_parts}\n"
                 "Try lower video resolution or lower audio quality."
             )
 
@@ -296,7 +295,7 @@ class TelegramYtdlpBot:
             self.state.save()
 
         try:
-            if chunks == 1:
+            if segments_needed == 1:
                 filename = artifact_filename(record)
                 with record.path.open("rb") as handle:
                     if record.media == "video":
@@ -309,7 +308,7 @@ class TelegramYtdlpBot:
                         await message.reply_audio(
                             audio=InputFile(handle, filename=filename),
                             title=record.title,
-                            caption=format_size(record.size_bytes),
+                            caption=f"{record.title}\n{format_size(record.size_bytes)}",
                         )
                     else:
                         await message.reply_document(
@@ -317,10 +316,13 @@ class TelegramYtdlpBot:
                             caption=f"{record.title}\n{format_size(record.size_bytes)}",
                         )
             else:
-                await message.reply_text(
-                    f"Sending {format_size(record.size_bytes)} in {chunks} parts."
-                )
-                await self.send_artifact_parts(message, record, chunks)
+                try:
+                    await self.send_playable_segments(message, record)
+                except (DownloadFailure, SegmentError):
+                    async with self.state_lock:
+                        self.state.remove_artifact(record.key)
+                        self.state.save()
+                    raise
         except Exception:
             async with self.state_lock:
                 if not from_cache:
@@ -329,34 +331,69 @@ class TelegramYtdlpBot:
                 self.state.save()
             raise
 
-    async def send_artifact_parts(self, message, record: ArtifactRecord, chunks: int) -> None:
-        base_name = artifact_filename(record)
-        chunks_dir = self.config.data_dir / "chunks" / record.key
-        offset = 0
+    async def send_playable_segments(self, message, record: ArtifactRecord) -> None:
+        segments_dir = self.config.data_dir / "segments" / record.key
         try:
-            for index in range(1, chunks + 1):
-                part_size = min(self.config.telegram_part_size_bytes, record.size_bytes - offset)
-                part_path = chunks_dir / f"{base_name}.part{index:03d}of{chunks:03d}"
-                await asyncio.to_thread(
-                    write_file_part,
-                    record.path,
-                    part_path,
-                    offset,
-                    part_size,
+            segments = await asyncio.to_thread(
+                split_playable_media,
+                record.path,
+                segments_dir,
+                record.media,
+                self.config.telegram_part_size_bytes,
+            )
+            if len(segments) > self.config.max_upload_parts:
+                raise DownloadFailure(
+                    "Artifact needs more playable media segments than allowed.\n"
+                    f"Segments: {len(segments)}\n"
+                    f"Max segments: {self.config.max_upload_parts}"
                 )
-                LOGGER.info("Uploading part %d/%d key=%s size=%s", index, chunks, record.key, format_size(part_size))
-                with part_path.open("rb") as handle:
-                    await message.reply_document(
-                        document=InputFile(handle, filename=part_path.name),
-                        caption=f"{record.title}\nPart {index}/{chunks}",
-                    )
-                part_path.unlink(missing_ok=True)
-                offset += part_size
+            for segment in segments:
+                await self.send_segment(message, record, segment)
         finally:
-            if chunks_dir.exists():
-                for leftover in chunks_dir.glob("*"):
+            if segments_dir.exists():
+                for leftover in segments_dir.glob("*"):
                     leftover.unlink(missing_ok=True)
-                chunks_dir.rmdir()
+                segments_dir.rmdir()
+
+    async def send_segment(self, message, record: ArtifactRecord, segment: MediaSegment) -> None:
+        LOGGER.info(
+            "Uploading playable segment %d/%d key=%s size=%s",
+            segment.index,
+            segment.total,
+            record.key,
+            format_size(segment.size_bytes),
+        )
+        filename = self.segment_filename(record, segment)
+        caption = (
+            f"{record.title}\n"
+            f"Segment {segment.index}/{segment.total}\n"
+            f"{format_size(segment.size_bytes)}"
+        )
+        with segment.path.open("rb") as handle:
+            if record.media == "video":
+                await message.reply_video(
+                    video=InputFile(handle, filename=filename),
+                    caption=caption,
+                    supports_streaming=True,
+                )
+            else:
+                await message.reply_audio(
+                    audio=InputFile(handle, filename=filename),
+                    title=f"{record.title} ({segment.index}/{segment.total})",
+                    caption=caption,
+                )
+
+    def segment_filename(self, record: ArtifactRecord, segment: MediaSegment) -> str:
+        source_name = artifact_filename(record)
+        stem = source_name.rsplit(".", 1)[0]
+        suffix = segment.path.suffix or record.path.suffix
+        return f"{stem} [{segment.index:02d}-{segment.total:02d}]{suffix}"
+
+    async def delete_message_safely(self, message) -> None:
+        try:
+            await message.delete()
+        except Exception:
+            LOGGER.debug("Could not delete message", exc_info=True)
 
     async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self.require_admin(update):

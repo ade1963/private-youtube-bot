@@ -1,12 +1,13 @@
 import asyncio
 from datetime import date
 from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
 
 from bot_config import load_config, parse_chat_ids, parse_size
 from bot import TelegramYtdlpBot
 from env_file import update_env_list
-from file_parts import part_count, write_file_part
 from media_settings import MediaSettings
+from media_segments import segment_count
 from state_store import ArtifactRecord, StateStore, current_week_start, now_iso
 from user_registry import UserRegistry
 from url_tools import cache_identity, clean_url
@@ -137,15 +138,8 @@ def test_user_registry_stores_nickname(tmp_path):
     assert reloaded.list_users()[0].nickname == "Alice"
 
 
-def test_write_file_part_creates_binary_chunk(tmp_path):
-    source = tmp_path / "source.bin"
-    target = tmp_path / "target.part"
-    source.write_bytes(b"abcdef")
-
-    write_file_part(source, target, offset=2, size_bytes=3)
-
-    assert target.read_bytes() == b"cde"
-    assert part_count(101, 50) == 3
+def test_segment_count_estimates_needed_playable_segments():
+    assert segment_count(101, 50) == 3
 
 
 def test_media_settings_update_validates_values():
@@ -236,3 +230,11 @@ def test_fresh_download_charges_weekly_usage(tmp_path):
     asyncio.run(bot.send_artifact(123, message, record, from_cache=False))
 
     assert bot.state.get_week_usage(123) == 200
+
+
+def test_segment_filename_keeps_extension(tmp_path):
+    bot = _make_bot(tmp_path)
+    record = _make_record(tmp_path, media="audio", size=100)
+    segment = SimpleNamespace(index=1, total=2, path=tmp_path / "segment-000.mp3")
+
+    assert bot.segment_filename(record, segment).endswith("[01-02].mp3")
